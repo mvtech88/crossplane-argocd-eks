@@ -1,0 +1,47 @@
+# -*- mode: ruby -*-
+# vi:set ft=ruby sw=2 ts=2 sts=2:
+
+# Define the number of master and worker nodes
+# If this number is changed, remember to update setup-hosts.sh script with the new hosts IP details in /etc/hosts of each VM.
+
+
+# All Vagrant configuration is done below. The "2" in Vagrant.configure
+# configures the configuration version (we support older styles for
+# backwards compatibility). Please don't change it unless you know what
+# you're doing.
+
+Vagrant.configure("2") do |config|
+ required_plugins = %w( vagrant-vbguest vagrant-disksize )
+  _retry = false
+  required_plugins.each do |plugin|
+      unless Vagrant.has_plugin? plugin
+          system "vagrant plugin install #{plugin}"
+          _retry=true
+      end
+  end
+  if (_retry)
+      exec "vagrant " + ARGV.join(' ')
+  end
+  config.vbguest.installer_options = { allow_kernel_upgrade: false } 
+  config.vm.box = "ubuntu/bionic64"
+#  config.disksize.size = '20GB'
+  config.vm.synced_folder '.', '/vagrant', disabled: true
+  config.vm.box_check_update = false
+  config.vm.network "private_network", ip: "192.168.5.78"
+  config.vm.network "forwarded_port", guest: 22, host: 8022
+
+  # Provision Ansible Node
+  config.vm.define "k8s-cluster-crossplane-2" do |node|
+    node.vm.provider "virtualbox" do |vb|
+        vb.name = "k8s-cluster-crossplane-2"
+        vb.memory = 4096
+        vb.cpus = 4
+        vb.customize [ "modifyvm", :id, "--uartmode1", "disconnected" ]
+    end
+    node.vm.hostname = "k8s-cluster-crossplane-2"
+    config.vm.provision "ansible" do |ansible|
+    ansible.playbook = "playbook.yml"
+    ansible.vault_password_file="/home/m6verma/cluster-crossplane/pass.txt"
+    end
+end
+end

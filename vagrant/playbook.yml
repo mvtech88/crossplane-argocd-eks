@@ -1,0 +1,305 @@
+---
+- hosts: k8s-cluster-crossplane-2
+  become: true
+  vars:
+   aws_access_key_id: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          37343038623832356465666561313035356431393864316636613837666631646466373534376565
+          6565633463343436666632396134646436353332346431660a373037333063346531316461653938
+          39626535643231626364646666393039323039353562323236383538646365346534383139353232
+          6531393330396137380a333237346438316339333931663636663238356561653866643564313130
+          65343664333930346530306165636338623131623364393030366238636136666361
+   aws_secret_access_key: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          64363430386264306437373937616339613437306634623136363631303832666462306364333736
+          3865666235303336663163326235633931383936366636310a626263306633666633303362353562
+          37313737656361336664333434636134346531323937393739333436313062613932626661396335
+          3162316639313866610a383233333437353638636333646130323337383762366633323931323362
+          64656666393635326433613532623838356133306138323330626437663064346430646564633432
+          3230393232396266306165306665386534326164393861346431
+   
+  tasks:
+
+  - name: Update apt repo and cache on all Debian/Ubuntu boxes
+    apt: update_cache=yes force_apt_get=yes cache_valid_time=3600
+
+  - name: Upgrade all packages on servers
+    apt: upgrade=dist force_apt_get=yes
+
+  - name: Check if a reboot is needed on all servers
+    register: reboot_required_file
+    stat: path=/var/run/reboot-required get_md5=no
+  - name: Reboot the box if kernel updated
+    reboot:
+        msg: "Reboot initiated by Ansible for kernel updates"
+        connect_timeout: 5
+        reboot_timeout: 300
+        pre_reboot_delay: 0
+        post_reboot_delay: 30
+        test_command: uptime
+    when: reboot_required_file.stat.exists
+
+  - name: Install aptitude using apt
+    apt: name=aptitude state=latest update_cache=yes force_apt_get=yes
+
+  - name: install the packages 
+    apt: 
+     name: "{{ item }}" 
+     state: latest
+     update_cache: yes 
+    loop: 
+     - apt-transport-https
+     - ca-certificates
+     - wget
+     - cloud-utils
+     - curl
+     - software-properties-common
+     - python3-pip
+     - virtualenv 
+     - python3-setuptools
+     - unzip
+     - jq
+  
+
+  - name: Add Docker GPG apt Key
+    apt_key:
+      url: https://download.docker.com/linux/ubuntu/gpg
+      state: present
+
+  - name: Add Docker Repository
+    apt_repository:
+     repo: deb https://download.docker.com/linux/ubuntu bionic stable
+     state: present
+ 
+ 
+  - name: Update apt and install docker-ce
+    apt: update_cache=yes name=docker-ce state=latest
+
+  - name: Install Docker Module for Python    
+    pip:
+        name: docker
+  
+  - name: Start Docker service
+    service:
+        name: docker
+        state: started
+        enabled: yes
+
+  - name: Add user vagrant to docker group
+    user:
+       name: vagrant
+       groups: docker
+       append: yes
+
+  - name: setfacl for the user 
+    shell: | 
+      sudo setfacl --modify user:vagrant:rw /var/run/docker.sock
+      
+ 
+
+  - name: Install Kubernetes binaries
+    shell: |
+     sudo snap install kubectl --classic 
+
+  - name: checking for helm installation
+    stat:
+     path: /bin/helm
+    register: helm_check
+ 
+  - name: install helm in the cluster
+    shell: | 
+      sudo wget https://get.helm.sh/helm-v3.6.3-linux-amd64.tar.gz --no-check-certificate
+      sudo tar -zxvf helm-v3.6.3-linux-amd64.tar.gz
+      sudo mv  ./linux-amd64/helm /bin
+    when: not helm_check.stat.exists
+
+  - name: check for the helm-repo
+    become_user: vagrant
+    command: helm repo list
+    register: helmrepo
+    ignore_errors: True
+
+  - name: add the helm repo
+    become_user: vagrant
+    command: "{{ item }}"
+    with_items:
+     - helm repo add bitnami https://charts.bitnami.com/bitnami
+     - helm repo add crossplane-stable https://charts.crossplane.io/stable
+     - helm repo add sealed-secrets "oci://registry-1.docker.io/bitnamicharts/sealed-secrets"
+
+    ignore_errors: True
+    when: "helmrepo.rc != 0 "
+
+  - name: checking for kubeseal installation
+    stat:
+     path: /bin/kubeseal
+    register: kubeseal_check
+
+  - name: install kubeseal in the cluster
+    shell: |
+      sudo wget https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.17.3/kubeseal-0.17.3-linux-amd64.tar.gz --no-check-certificate
+      sudo tar xvfz kubeseal-0.17.3-linux-amd64.tar.gz
+      sudo mv  ./kubeseal /bin
+    when: not kubeseal_check.stat.exists
+  
+  - name: checking for argocd cli installation
+    stat:
+     path: /usr/local/bin/argocd
+    register: argocdcli_check
+
+  - name: install argocd cli in the cluster
+    shell: |
+      sudo curl -skSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+      sudo  chmod +x /usr/local/bin/argocd
+    when: not argocdcli_check.stat.exists
+
+  - name: checking for crossplane-binary
+    stat:
+     path: /usr/local/bin/crossplane
+    register: cross_check
+
+  - name: install crossplane binary in the cluster
+    shell: |
+      curl -sL "https://raw.githubusercontent.com/crossplane/crossplane/master/install.sh" | sh
+      sudo mv crossplane /usr/local/bin
+    when: not cross_check.stat.exists
+
+
+  - name: Creates directory
+    file:
+     path: /home/vagrant/kind/
+     owner: vagrant
+     mode: 0755
+     state: directory
+
+
+  - name: checking for aws-binary
+    stat:
+     path: /usr/local/bin/aws
+    register: aws_check
+  
+  - name: Configure the aws cli
+    become_user: vagrant
+    shell: |
+      sudo curl -k "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+      sudo unzip awscliv2.zip
+      sudo ./aws/install 
+    when: not aws_check.stat.exists
+      
+
+  - name: Copying a kind file to directory
+    copy:
+     src: ./kind.yaml
+     dest: /home/vagrant/kind 
+
+  - name: installing KIND for centos
+    shell: |
+      cd /home/vagrant/kind/
+      sudo curl -kLo ./kind https://github.com/kubernetes-sigs/kind/releases/download/v0.24.0/kind-linux-amd64  
+      sudo chmod +x ./kind
+      sudo mv ./kind /bin/kind
+
+  - name: increase the diskspace of root system
+    shell: | 
+     sudo growpart /dev/sda 1
+     sudo resize2fs /dev/sda1  
+ 
+  - name: configure aws cli
+    become_user: vagrant
+    command: "{{item}}"
+    with_items:
+    - aws configure set aws_access_key_id "{{ aws_access_key_id }}"
+    - aws configure set aws_secret_access_key "{{ aws_secret_access_key }}"
+ 
+  - name: check cluster if present
+    shell: | 
+     kind get clusters 
+    register: kind_output
+ 
+  - name: delete cluster if present 
+    become_user: vagrant
+    become: true
+    shell: | 
+     kind delete cluster --name k8s-cluster
+    when: kind_output.stdout == "k8s-cluster" 
+  
+  - name: install the cluster using kind 
+    become_user: vagrant
+    become: true
+    shell: |
+      kind create cluster --name k8s-cluster --config /home/vagrant/kind/kind.yaml
+ 
+  - name: wait for pods to come up
+    become_user: vagrant
+    shell: kubectl get pods -n kube-system -o json
+    register: kubectl_get_pods
+    until: kubectl_get_pods.stdout|from_json|json_query('items[*].status.phase')|unique == ["Running"]
+    retries: 400
+    ignore_errors: True
+
+ 
+  - name: install k8s mandatory steps
+    become_user: vagrant
+    command: "{{ item }}"
+    with_items:
+     - kubectl create namespace crossplane-system
+     - kubectl create ns argocd
+     - kubectl create ns sealed-secrets
+     - kubectl create ns crossplane
+     - kubectl taint node k8s-cluster-control-plane node-role.kubernetes.io/master-
+    ignore_errors: True
+
+  - name: install crossplane via helm
+    become_user: vagrant
+    command: "{{ item }}"
+    with_items:
+     - helm install crossplane --namespace crossplane-system crossplane-stable/crossplane --version 1.4.1
+    ignore_errors: True 
+ 
+  - name: install bitnami sealed secrets  via helm
+    become_user: vagrant
+    command: "{{ item }}"
+    with_items:
+     - helm install sealed-secrets -n sealed-secrets --set-string fullnameOverride=sealed-secrets-controller sealed-secrets/sealed-secrets
+    ignore_errors: True
+      
+  - name: download argocd file
+    become_user: vagrant
+    command: "{{ item }}"
+    with_items:
+     - sudo wget https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml  --no-check-certificate
+    ignore_errors: True
+
+  - name: install argocd via kubectl
+    become_user: vagrant
+    command: "{{ item }}"
+    with_items:
+     - kubectl -n argocd apply -f /home/vagrant/install.yaml
+
+  - name: Sleep for 80 seconds and timeout
+    tags: sleep80
+    wait_for:
+       delay: 80
+       timeout: 0
+
+
+  - name: Enable Password Authentication
+    lineinfile:
+           dest: /etc/ssh/sshd_config
+           regexp: '^PasswordAuthentication'
+           line: "PasswordAuthentication yes"
+           state: present
+           backup: yes
+    notify:
+     - restart ssh
+
+  - name: Correct openssl parameter
+    lineinfile:
+           dest: /etc/ssl/openssl.cnf
+           regexp: '^RANDFILE'
+           state: absent
+           backup: yes
+
+  handlers:
+  - name: restart ssh
+    service: name=sshd state=restarted
